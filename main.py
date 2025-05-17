@@ -3,11 +3,12 @@ import shutil
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
-from langchain.embeddings import SentenceTransformerEmbeddings
-from langchain.vectorstores import FAISS
+from langchain_community.embeddings import SentenceTransformerEmbeddings
+from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import CharacterTextSplitter
 from utils import load_documents_from_folder
 import gradio as gr
+
 
 VECTOR_STORE_PATH = "./faiss_index"
 DOCUMENTS_PATH = "./docs"
