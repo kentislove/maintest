@@ -1,95 +1,180 @@
 import os
-import shutil
-from fastapi import FastAPI
+import json
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
-from langchain_community.embeddings import SentenceTransformerEmbeddings
+from langchain_cohere import CohereEmbeddings, ChatCohere
 from langchain_community.vectorstores import FAISS
+from langchain.chains import RetrievalQA
 from langchain.text_splitter import CharacterTextSplitter
 from utils import load_documents_from_folder
 import gradio as gr
+from typing import List
 
+# 你的 Cohere API Key，建議實際用時設在環境變數以保安全
+COHERE_API_KEY = "DS1Ess8AcMXnuONkQKdQ56GmHXI7u7tkQekQrZDJ"
 
 VECTOR_STORE_PATH = "./faiss_index"
 DOCUMENTS_PATH = "./docs"
+DOCS_STATE_PATH = os.path.join(VECTOR_STORE_PATH, "last_docs.json")
 os.makedirs(VECTOR_STORE_PATH, exist_ok=True)
 os.makedirs(DOCUMENTS_PATH, exist_ok=True)
 
-embedding_model = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
-
+# 改用 Cohere Embedding + LLM
+embedding_model = CohereEmbeddings(
+    cohere_api_key=COHERE_API_KEY,
+    model="embed-multilingual-v3.0"  # 支援中/英/多語檢索
+)
+llm = ChatCohere(
+    cohere_api_key=COHERE_API_KEY,
+    model="command-r-plus",           # 你也可以用 command、command-r
+    temperature=0.3
+)
 vectorstore = None
+qa = None
 
-def build_vector_store():
+def get_current_docs_state() -> dict:
+    docs_state = {}
+    for f in os.listdir(DOCUMENTS_PATH):
+        path = os.path.join(DOCUMENTS_PATH, f)
+        if os.path.isfile(path):
+            docs_state[f] = os.path.getmtime(path)
+    return docs_state
+
+def load_last_docs_state() -> dict:
+    if os.path.exists(DOCS_STATE_PATH):
+        with open(DOCS_STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_docs_state(state: dict):
+    with open(DOCS_STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+def get_new_or_updated_files(current: dict, last: dict) -> List[str]:
+    changed = []
+    for name, mtime in current.items():
+        if name not in last or last[name] < mtime:
+            changed.append(name)
+    return changed
+
+def build_vector_store(docs_state: dict = None):
     documents = load_documents_from_folder(DOCUMENTS_PATH)
-    if not documents:
-        return "資料夾內沒有文件，請先上傳文件"
-    splitter = CharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    splitter = CharacterTextSplitter(chunk_size=500, chunk_overlap=100)
     texts = splitter.split_documents(documents)
+    if not texts:
+        raise RuntimeError("docs 資料夾內沒有可用文件，無法建立向量資料庫，請至少放入一份 txt/pdf/docx/xlsx/csv 檔案！")
     db = FAISS.from_documents(texts, embedding_model)
     db.save_local(VECTOR_STORE_PATH)
-    global vectorstore
-    vectorstore = db
-    return "向量庫建立成功"
+    if docs_state:
+        save_docs_state(docs_state)
+    return db
 
-def load_vector_store():
-    global vectorstore
+def add_new_files_to_vector_store(db, new_files: List[str], docs_state: dict):
+    from langchain.schema import Document
+    from langchain_community.document_loaders import (
+        TextLoader,
+        UnstructuredPDFLoader,
+        UnstructuredWordDocumentLoader,
+        UnstructuredExcelLoader
+    )
+    splitter = CharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    new_documents = []
+    for file in new_files:
+        filepath = os.path.join(DOCUMENTS_PATH, file)
+        if os.path.isfile(filepath):
+            ext = os.path.splitext(file)[1].lower()
+            if ext == ".txt":
+                loader = TextLoader(filepath, autodetect_encoding=True)
+                docs = loader.load()
+            elif ext == ".pdf":
+                loader = UnstructuredPDFLoader(filepath)
+                docs = loader.load()
+            elif ext == ".docx":
+                loader = UnstructuredWordDocumentLoader(filepath)
+                docs = loader.load()
+            elif ext in [".xlsx", ".xls"]:
+                loader = UnstructuredExcelLoader(filepath)
+                docs = loader.load()
+            elif ext == ".csv":
+                from utils import parse_csv_file
+                docs = parse_csv_file(filepath)
+            else:
+                print(f"不支援的格式：{file}")
+                continue
+            new_documents.extend(docs)
+    if new_documents:
+        texts = splitter.split_documents(new_documents)
+        db.add_documents(texts)
+        db.save_local(VECTOR_STORE_PATH)
+        save_docs_state(docs_state)
+    return db
+
+def ensure_qa():
+    global vectorstore, qa
+    current_docs_state = get_current_docs_state()
+    last_docs_state = load_last_docs_state()
     if vectorstore is None:
         if os.path.exists(VECTOR_STORE_PATH) and os.listdir(VECTOR_STORE_PATH):
             vectorstore = FAISS.load_local(VECTOR_STORE_PATH, embedding_model)
-
-def similarity_search(query):
-    load_vector_store()
-    if vectorstore is None:
-        return "向量庫不存在，請先建立向量庫"
-    docs = vectorstore.similarity_search(query, k=3)
-    if not docs:
-        return "查無相似資料"
-    results = "\n\n".join([doc.page_content for doc in docs])
-    return results
-
-def save_uploaded_files(files):
-    allowed_exts = {".doc", ".docx", ".xls", ".xlsx", ".pdf", ".txt"}
-    saved_files = []
-    if not files:
-        return "請選擇文件"
-    if not isinstance(files, list):
-        files = [files]
-    for f in files:
-        ext = os.path.splitext(f.name)[1].lower()
-        if ext not in allowed_exts:
-            continue
-        save_path = os.path.join(DOCUMENTS_PATH, os.path.basename(f.name))
-        shutil.copy(f.name, save_path)
-        saved_files.append(os.path.basename(f.name))
-    if saved_files:
-        return f"檔案已上傳，請點「建立向量庫」\n已上傳: {', '.join(saved_files)}"
+            new_files = get_new_or_updated_files(current_docs_state, last_docs_state)
+            if new_files:
+                print(f"偵測到新文件或文件變動：{new_files}，自動增量加入向量庫！")
+                vectorstore = add_new_files_to_vector_store(vectorstore, new_files, current_docs_state)
+            elif len(current_docs_state) != len(last_docs_state):
+                print(f"文件數變動，重新建構向量庫")
+                vectorstore = build_vector_store(current_docs_state)
+        else:
+            vectorstore = build_vector_store(current_docs_state)
     else:
-        return "未上傳有效文件"
+        new_files = get_new_or_updated_files(current_docs_state, last_docs_state)
+        if new_files:
+            print(f"偵測到新文件或文件變動：{new_files}，自動增量加入向量庫！")
+            vectorstore = add_new_files_to_vector_store(vectorstore, new_files, current_docs_state)
+        elif len(current_docs_state) != len(last_docs_state):
+            print(f"文件數變動，重新建構向量庫")
+            vectorstore = build_vector_store(current_docs_state)
 
-with gr.Blocks(title="純向量搜尋 AI BOX") as demo:
-    query = gr.Textbox(label="請輸入查詢")
-    submit = gr.Button("查詢")
-    answer = gr.Textbox(label="搜尋結果", interactive=False, show_copy_button=True)
-    upload = gr.File(label="上傳文件", file_types=[".doc", ".docx", ".xls", ".xlsx", ".pdf", ".txt"], file_count="multiple")
-    upload_btn = gr.Button("上傳")
-    build_btn = gr.Button("建立向量庫")
-    status = gr.Markdown()
+    if qa is None:
+        qa = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",
+            retriever=vectorstore.as_retriever()
+        )
 
-    submit.click(fn=similarity_search, inputs=query, outputs=answer)
-    upload_btn.click(fn=save_uploaded_files, inputs=upload, outputs=status)
-    build_btn.click(fn=build_vector_store, inputs=None, outputs=status)
+def rag_answer(question):
+    ensure_qa()
+    return qa.run(question)
+
+# Gradio UI
+with gr.Blocks() as demo:
+    gr.Markdown("# Cohere 向量檢索問答機器人")
+    with gr.Row():
+        with gr.Column():
+            question_box = gr.Textbox(label="輸入問題", placeholder="請輸入問題")
+            submit_btn = gr.Button("送出")
+        with gr.Column():
+            answer_box = gr.Textbox(label="AI 回答")
+    submit_btn.click(fn=rag_answer, inputs=question_box, outputs=answer_box)
 
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 from gradio.routes import mount_gradio_app
 app = mount_gradio_app(app, demo, path="/gradio")
 
 @app.get("/", include_in_schema=False)
 async def root():
     return RedirectResponse(url="/gradio")
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    payload = await request.json()
+    user_message = payload.get("message", "")
+    reply = rag_answer(user_message)
+    return {"reply": reply}
