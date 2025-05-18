@@ -148,7 +148,7 @@ def rag_answer(question):
 
 # Gradio UI
 with gr.Blocks() as demo:
-    gr.Markdown("# Cohere 向量檢索問答機器人")
+    gr.Markdown("# FAQ 問答集")
     with gr.Row():
         with gr.Column():
             question_box = gr.Textbox(label="輸入問題", placeholder="請輸入問題")
