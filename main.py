@@ -33,55 +33,11 @@ llm = ChatCohere(
 )
 vectorstore = None
 qa = None
+
 def get_uploaded_files_list():
     """回傳目前 docs 資料夾內所有檔名清單。"""
     files = os.listdir(DOCUMENTS_PATH)
     return "\n".join(files) if files else "(目前沒有檔案)"
-
-def handle_upload(files, progress=gr.Progress()):
-    """處理檔案上傳與向量庫增量更新（含進度條）"""
-    new_files = []
-    total = len(files)
-    for idx, file in enumerate(files):
-        filename = os.path.basename(file.name)
-        dest = os.path.join(DOCUMENTS_PATH, filename)
-        shutil.copyfile(file.name, dest)
-        new_files.append(filename)
-        progress((idx + 1) / total, desc=f"複製檔案：{filename}")
-    # 建庫
-    progress(0.8, desc="正在匯入向量庫 ...")
-    current_docs_state = get_current_docs_state()
-    last_docs_state = load_last_docs_state()
-    db = None
-    if os.path.exists(VECTOR_STORE_PATH) and os.listdir(VECTOR_STORE_PATH):
-        db = FAISS.load_local(VECTOR_STORE_PATH, embedding_model)
-    else:
-        db = build_vector_store(current_docs_state)
-        return (f"向量庫首次建立完成，共匯入 {len(new_files)} 檔案。", get_uploaded_files_list())
-    add_new_files_to_vector_store(db, new_files, current_docs_state)
-    progress(1.0, desc="完成！")
-    return (f"成功匯入 {len(new_files)} 檔案並加入向量庫：{', '.join(new_files)}", get_uploaded_files_list())
-
-with gr.Blocks() as demo:
-    gr.Markdown("# Cohere 向量檢索問答機器人")
-    with gr.Row():
-        with gr.Column():
-            upload_box = gr.File(label="上傳新文件（支援 txt/pdf/docx/xlsx/csv，多選）", file_count="multiple")
-            upload_btn = gr.Button("匯入並轉換成向量資料庫")
-            status_box = gr.Textbox(label="操作狀態/訊息")
-            file_list_box = gr.Textbox(label="已上傳檔案清單", value=get_uploaded_files_list(), interactive=False, lines=8)
-        with gr.Column():
-            question_box = gr.Textbox(label="輸入問題", placeholder="請輸入問題")
-            submit_btn = gr.Button("送出")
-            answer_box = gr.Textbox(label="AI 回答")
-    # 綁定 upload
-    upload_btn.click(
-        fn=handle_upload,
-        inputs=[upload_box],
-        outputs=[status_box, file_list_box]
-    )
-    # 問答
-    submit_btn.click(fn=rag_answer, inputs=question_box, outputs=answer_box)
 
 def get_current_docs_state() -> dict:
     docs_state = {}
@@ -196,17 +152,53 @@ def rag_answer(question):
     ensure_qa()
     return qa.run(question)
 
-# Gradio UI
+def handle_upload(files, progress=gr.Progress()):
+    """處理檔案上傳與向量庫增量更新（含進度條）"""
+    new_files = []
+    total = len(files)
+    for idx, file in enumerate(files):
+        filename = os.path.basename(file.name)
+        dest = os.path.join(DOCUMENTS_PATH, filename)
+        shutil.copyfile(file.name, dest)
+        new_files.append(filename)
+        progress((idx + 1) / total, desc=f"複製檔案：{filename}")
+    # 建庫
+    progress(0.8, desc="正在匯入向量庫 ...")
+    current_docs_state = get_current_docs_state()
+    last_docs_state = load_last_docs_state()
+    db = None
+    if os.path.exists(VECTOR_STORE_PATH) and os.listdir(VECTOR_STORE_PATH):
+        db = FAISS.load_local(VECTOR_STORE_PATH, embedding_model)
+    else:
+        db = build_vector_store(current_docs_state)
+        return (f"向量庫首次建立完成，共匯入 {len(new_files)} 檔案。", get_uploaded_files_list())
+    add_new_files_to_vector_store(db, new_files, current_docs_state)
+    progress(1.0, desc="完成！")
+    return (f"成功匯入 {len(new_files)} 檔案並加入向量庫：{', '.join(new_files)}", get_uploaded_files_list())
+
+# ===== Gradio UI 主程式（合併問答與上傳功能） =====
 with gr.Blocks() as demo:
-    gr.Markdown("# FAQ 問答集")
+    gr.Markdown("# Cohere 向量檢索問答機器人")
     with gr.Row():
+        with gr.Column():
+            upload_box = gr.File(label="上傳新文件（支援 txt/pdf/docx/xlsx/csv，多選）", file_count="multiple")
+            upload_btn = gr.Button("匯入並轉換成向量資料庫")
+            status_box = gr.Textbox(label="操作狀態/訊息")
+            file_list_box = gr.Textbox(label="已上傳檔案清單", value=get_uploaded_files_list(), interactive=False, lines=8)
         with gr.Column():
             question_box = gr.Textbox(label="輸入問題", placeholder="請輸入問題")
             submit_btn = gr.Button("送出")
-        with gr.Column():
             answer_box = gr.Textbox(label="AI 回答")
+    # 上傳按鈕綁定
+    upload_btn.click(
+        fn=handle_upload,
+        inputs=[upload_box],
+        outputs=[status_box, file_list_box]
+    )
+    # 問答功能
     submit_btn.click(fn=rag_answer, inputs=question_box, outputs=answer_box)
 
+# ===== FastAPI 設定 =====
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
