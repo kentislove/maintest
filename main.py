@@ -122,7 +122,7 @@ def ensure_qa():
     last_docs_state = load_last_docs_state()
     if vectorstore is None:
         if os.path.exists(VECTOR_STORE_PATH) and os.listdir(VECTOR_STORE_PATH):
-            vectorstore = FAISS.load_local(VECTOR_STORE_PATH, embedding_model)
+            vectorstore = FAISS.load_local(VECTOR_STORE_PATH, embedding_model, allow_dangerous_deserialization=True)
             new_files = get_new_or_updated_files(current_docs_state, last_docs_state)
             if new_files:
                 print(f"偵測到新文件或文件變動：{new_files}，自動增量加入向量庫！")
@@ -168,7 +168,7 @@ def handle_upload(files, progress=gr.Progress()):
     last_docs_state = load_last_docs_state()
     db = None
     if os.path.exists(VECTOR_STORE_PATH) and os.listdir(VECTOR_STORE_PATH):
-        db = FAISS.load_local(VECTOR_STORE_PATH, embedding_model)
+        db = FAISS.load_local(VECTOR_STORE_PATH, embedding_model, allow_dangerous_deserialization=True)
     else:
         db = build_vector_store(current_docs_state)
         return (f"向量庫首次建立完成，共匯入 {len(new_files)} 檔案。", get_uploaded_files_list())
