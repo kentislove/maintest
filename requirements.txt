@@ -15,4 +15,3 @@ langchain-huggingface
 langchain-openai
 langchain-cohere
 cohere
-pdfminer.six

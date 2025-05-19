@@ -8,7 +8,6 @@ from langchain_community.document_loaders import (
     UnstructuredExcelLoader
 )
 
-
 def load_documents_from_folder(folder_path: str) -> List[Document]:
     docs = []
     for file in os.listdir(folder_path):
@@ -17,7 +16,7 @@ def load_documents_from_folder(folder_path: str) -> List[Document]:
             loader = TextLoader(filepath, autodetect_encoding=True)
         elif file.endswith(".pdf"):
             loader = UnstructuredPDFLoader(filepath)
-        elif file.endswith(".docx"):
+        elif file.endswith(".doc") or file.endswith(".docx"):
             loader = UnstructuredWordDocumentLoader(filepath)
         elif file.endswith(".xlsx") or file.endswith(".xls"):
             loader = UnstructuredExcelLoader(filepath)

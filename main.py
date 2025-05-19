@@ -12,7 +12,6 @@ from langchain.text_splitter import CharacterTextSplitter
 from utils import load_documents_from_folder
 from typing import List
 
-# 你的 Cohere API Key，建議實際用時設在環境變數以保安全
 COHERE_API_KEY = "DS1Ess8AcMXnuONkQKdQ56GmHXI7u7tkQekQrZDJ"
 
 VECTOR_STORE_PATH = "./faiss_index"
@@ -21,21 +20,19 @@ DOCS_STATE_PATH = os.path.join(VECTOR_STORE_PATH, "last_docs.json")
 os.makedirs(VECTOR_STORE_PATH, exist_ok=True)
 os.makedirs(DOCUMENTS_PATH, exist_ok=True)
 
-# 改用 Cohere Embedding + LLM
 embedding_model = CohereEmbeddings(
     cohere_api_key=COHERE_API_KEY,
-    model="embed-multilingual-v3.0"  # 支援中/英/多語檢索
+    model="embed-multilingual-v3.0"
 )
 llm = ChatCohere(
     cohere_api_key=COHERE_API_KEY,
-    model="command-r-plus",           # 你也可以用 command、command-r
+    model="command-r-plus",
     temperature=0.3
 )
 vectorstore = None
 qa = None
 
 def get_uploaded_files_list():
-    """回傳目前 docs 資料夾內所有檔名清單。"""
     files = os.listdir(DOCUMENTS_PATH)
     return "\n".join(files) if files else "(目前沒有檔案)"
 
@@ -69,7 +66,7 @@ def build_vector_store(docs_state: dict = None):
     splitter = CharacterTextSplitter(chunk_size=500, chunk_overlap=100)
     texts = splitter.split_documents(documents)
     if not texts:
-        raise RuntimeError("docs 資料夾內沒有可用文件，無法建立向量資料庫，請至少放入一份 txt/pdf/docx/xlsx/csv 檔案！")
+        raise RuntimeError("docs 資料夾內沒有可用文件，無法建立向量資料庫，請至少放入一份 txt/pdf/doc/docx/xls/xlsx/csv 檔案！")
     db = FAISS.from_documents(texts, embedding_model)
     db.save_local(VECTOR_STORE_PATH)
     if docs_state:
@@ -96,7 +93,7 @@ def add_new_files_to_vector_store(db, new_files: List[str], docs_state: dict):
             elif ext == ".pdf":
                 loader = UnstructuredPDFLoader(filepath)
                 docs = loader.load()
-            elif ext == ".docx":
+            elif ext in [".doc", ".docx"]:
                 loader = UnstructuredWordDocumentLoader(filepath)
                 docs = loader.load()
             elif ext in [".xlsx", ".xls"]:
@@ -153,7 +150,6 @@ def rag_answer(question):
     return qa.run(question)
 
 def handle_upload(files, progress=gr.Progress()):
-    """處理檔案上傳與向量庫增量更新（含進度條）"""
     new_files = []
     total = len(files)
     for idx, file in enumerate(files):
@@ -162,7 +158,6 @@ def handle_upload(files, progress=gr.Progress()):
         shutil.copyfile(file.name, dest)
         new_files.append(filename)
         progress((idx + 1) / total, desc=f"複製檔案：{filename}")
-    # 建庫
     progress(0.8, desc="正在匯入向量庫 ...")
     current_docs_state = get_current_docs_state()
     last_docs_state = load_last_docs_state()
@@ -176,26 +171,28 @@ def handle_upload(files, progress=gr.Progress()):
     progress(1.0, desc="完成！")
     return (f"成功匯入 {len(new_files)} 檔案並加入向量庫：{', '.join(new_files)}", get_uploaded_files_list())
 
-# ===== Gradio UI 主程式（合併問答與上傳功能） =====
+# ===== Gradio UI 主程式（新版版面配置） =====
 with gr.Blocks() as demo:
     gr.Markdown("# Cohere 向量檢索問答機器人")
     with gr.Row():
-        with gr.Column():
-            upload_box = gr.File(label="上傳新文件（支援 txt/pdf/docx/xlsx/csv，多選）", file_count="multiple")
-            upload_btn = gr.Button("匯入並轉換成向量資料庫")
-            status_box = gr.Textbox(label="操作狀態/訊息")
-            file_list_box = gr.Textbox(label="已上傳檔案清單", value=get_uploaded_files_list(), interactive=False, lines=8)
-        with gr.Column():
+        with gr.Column(scale=2):
             question_box = gr.Textbox(label="輸入問題", placeholder="請輸入問題")
             submit_btn = gr.Button("送出")
             answer_box = gr.Textbox(label="AI 回答")
-    # 上傳按鈕綁定
+        with gr.Column(scale=1):
+            upload_box = gr.File(
+                label="上傳新文件（支援 doc/docx/xls/xlsx/pdf/txt/csv，多選）",
+                file_count="multiple",
+                file_types=[".doc", ".docx", ".xls", ".xlsx", ".pdf", ".txt", ".csv"]
+            )
+            upload_btn = gr.Button("匯入並轉換成向量資料庫")
+            status_box = gr.Textbox(label="操作狀態/訊息")
+            file_list_box = gr.Textbox(label="已上傳檔案清單", value=get_uploaded_files_list(), interactive=False, lines=8)
     upload_btn.click(
         fn=handle_upload,
         inputs=[upload_box],
         outputs=[status_box, file_list_box]
     )
-    # 問答功能
     submit_btn.click(fn=rag_answer, inputs=question_box, outputs=answer_box)
 
 # ===== FastAPI 設定 =====
