@@ -1,201 +1,133 @@
 import os
-import shutil
-import gradio as gr
-import json
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
-from langchain_cohere import CohereEmbeddings, ChatCohere
-from langchain_community.vectorstores import FAISS
-from langchain.chains import RetrievalQA
-from langchain.text_splitter import CharacterTextSplitter
-from utils import load_documents_from_folder
-from typing import List
+from fastapi.responses import JSONResponse
+import gradio as gr
+from typing import List, Tuple
 
-COHERE_API_KEY = "DS1Ess8AcMXnuONkQKdQ56GmHXI7u7tkQekQrZDJ"
+# 改用開源嵌入模型
+# 使用新的導入路徑以避免 LangChainDeprecationWarning
+from langchain_huggingface import HuggingFaceEmbeddings # <--- IMPORTANT CHANGE HERE
+
+from langchain_community.vectorstores import FAISS
+from langchain.text_splitter import CharacterTextSplitter
+from utils import load_documents_from_folder # 確保 utils.py 檔案在同一個目錄下
+
+# LINE Bot SDK
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+
+# ====== 環境變數設定 (只保留 LINE Bot 相關，移除 LLM API Key) ======
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+# 調整相似度閾值，0.75-0.85 較常見，可依需求調整
+# L2 距離越小越相似，這裡的 SIMILARITY_THRESHOLD 是轉換後的相似度
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.75"))
+
+# ====== 模型與向量索引設定 ======
+# 使用您找到的 "tiny" 模型，例如 'cointegrated/rubert-tiny' 或 'sergeyzh/rubert-tiny-sts'
+# 為了確保模型能夠處理英文或其他常用語言，我建議嘗試以下其中一個：
+# embedding_model_name = "cointegrated/rubert-tiny" # <--- 您在圖中找到的一個
+# embedding_model_name = "sergeyzh/rubert-tiny-sts" # <--- 您在圖中找到的另一個
+# embedding_model_name = "johnpaulbin/bge-m3-distilled-tiny" # 另一個可能更通用的英文小模型
+
+# 這裡先選用一個，如果不行再換另一個 "tiny" 模型
+# 根據您的截圖，我會選用 cointegrated/rubert-tiny 或 sergeyzh/rubert-tiny-sts，它們是 sentence-transformers 系列的。
+# 選擇一個實際存在且能用於 sentence_transformers 的 tiny 模型。
+# 這裡假設 'cointegrated/rubert-tiny' 是一個好的起點。
+embedding_model_name = "johnpaulbin/bge-m3-distilled-tiny" # <--- 將此行替換為您選擇的 tiny 模型
+
+embedding_model = HuggingFaceEmbeddings(model_name=embedding_model_name)
 
 VECTOR_STORE_PATH = "./faiss_index"
-DOCUMENTS_PATH = "./docs"
-DOCS_STATE_PATH = os.path.join(VECTOR_STORE_PATH, "last_docs.json")
+DOCUMENTS_PATH = "./docs" # 這個在部署時其實可以不用讀取，但為了防止意外，保留路徑定義
+
+# 初始化 LINE Bot
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+# 確保資料目錄與索引資料夾
 os.makedirs(VECTOR_STORE_PATH, exist_ok=True)
 os.makedirs(DOCUMENTS_PATH, exist_ok=True)
+vectorstore: FAISS = None # 全局變數用於儲存載入的向量儲存
 
-embedding_model = CohereEmbeddings(
-    cohere_api_key=COHERE_API_KEY,
-    model="embed-multilingual-v3.0"
-)
-llm = ChatCohere(
-    cohere_api_key=COHERE_API_KEY,
-    model="command-r-plus",
-    temperature=0.3
-)
-vectorstore = None
-qa = None
-
-def get_uploaded_files_list():
-    files = os.listdir(DOCUMENTS_PATH)
-    return "\n".join(files) if files else "(目前沒有檔案)"
-
-def get_current_docs_state() -> dict:
-    docs_state = {}
-    for f in os.listdir(DOCUMENTS_PATH):
-        path = os.path.join(DOCUMENTS_PATH, f)
-        if os.path.isfile(path):
-            docs_state[f] = os.path.getmtime(path)
-    return docs_state
-
-def load_last_docs_state() -> dict:
-    if os.path.exists(DOCS_STATE_PATH):
-        with open(DOCS_STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-def save_docs_state(state: dict):
-    with open(DOCS_STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(state, f)
-
-def get_new_or_updated_files(current: dict, last: dict) -> List[str]:
-    changed = []
-    for name, mtime in current.items():
-        if name not in last or last[name] < mtime:
-            changed.append(name)
-    return changed
-
-def build_vector_store(docs_state: dict = None):
-    documents = load_documents_from_folder(DOCUMENTS_PATH)
+# ====== 向量索引建立 (這個函數主要用於本地建立索引，部署時應避免執行) ======
+def build_vector_store() -> FAISS:
+    docs = load_documents_from_folder(DOCUMENTS_PATH)
+    if not docs:
+        # 在部署環境下，如果沒有預先建立索引且 docs 為空，這裡會出錯
+        # 這是期望的行為，因為應該要有預先建立的索引
+        raise RuntimeError(f"在 '{DOCUMENTS_PATH}' 資料夾中找不到文件，無法建立索引。請確保已預先建立 FAISS 索引。")
     splitter = CharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-    texts = splitter.split_documents(documents)
-    if not texts:
-        raise RuntimeError("docs 資料夾內沒有可用文件，無法建立向量資料庫，請至少放入一份 txt/pdf/doc/docx/xls/xlsx/csv 檔案！")
-    db = FAISS.from_documents(texts, embedding_model)
-    db.save_local(VECTOR_STORE_PATH)
-    if docs_state:
-        save_docs_state(docs_state)
-    return db
+    texts = splitter.split_documents(docs)
+    faiss_db = FAISS.from_documents(texts, embedding_model)
+    faiss_db.save_local(VECTOR_STORE_PATH)
+    return faiss_db
 
-def add_new_files_to_vector_store(db, new_files: List[str], docs_state: dict):
-    from langchain.schema import Document
-    from langchain_community.document_loaders import (
-        TextLoader,
-        UnstructuredPDFLoader,
-        UnstructuredWordDocumentLoader,
-        UnstructuredExcelLoader
-    )
-    splitter = CharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-    new_documents = []
-    for file in new_files:
-        filepath = os.path.join(DOCUMENTS_PATH, file)
-        if os.path.isfile(filepath):
-            ext = os.path.splitext(file)[1].lower()
-            if ext == ".txt":
-                loader = TextLoader(filepath, autodetect_encoding=True)
-                docs = loader.load()
-            elif ext == ".pdf":
-                loader = UnstructuredPDFLoader(filepath)
-                docs = loader.load()
-            elif ext in [".doc", ".docx"]:
-                loader = UnstructuredWordDocumentLoader(filepath)
-                docs = loader.load()
-            elif ext in [".xlsx", ".xls"]:
-                loader = UnstructuredExcelLoader(filepath)
-                docs = loader.load()
-            elif ext == ".csv":
-                from utils import parse_csv_file
-                docs = parse_csv_file(filepath)
+# 載入或建立索引 (部署時主要執行載入，移除重建回退邏輯以避免 OOM)
+def ensure_vectorstore():
+    global vectorstore
+    if vectorstore is not None: # 如果已經載入過，就直接返回
+        return
+
+    # 檢查 faiss_index 資料夾是否存在 index.faiss 和 index.pkl
+    faiss_index_exists = os.path.exists(os.path.join(VECTOR_STORE_PATH, "index.faiss")) and \
+                         os.path.exists(os.path.join(VECTOR_STORE_PATH, "index.pkl"))
+
+    if not faiss_index_exists:
+        # 在部署環境下，如果沒有預先建立索引，這將是一個致命錯誤
+        print("致命錯誤：未找到 FAISS 索引。請確認已在本地建立索引並將 'faiss_index' 資料夾推送到 Git！")
+        vectorstore = None # 設置為 None，讓 rag_answer 返回錯誤訊息
+        # 您甚至可以選擇在這裡拋出異常，讓服務直接啟動失敗，而不是繼續運行一個沒有知識庫的服務
+        # raise RuntimeError("FAISS 索引缺失，應用程式無法啟動。")
+    else:
+        print("載入現有 FAISS 索引...")
+        try:
+            vectorstore = FAISS.load_local(VECTOR_STORE_PATH, embedding_model)
+            print("FAISS 索引載入完成。")
+        except Exception as e:
+            print(f"致命錯誤：載入 FAISS 索引失敗: {e}")
+            print("請檢查 'faiss_index' 資料夾的完整性，並確認 'embedding_model_name' 是否與建立索引時一致。")
+            vectorstore = None # 設置為 None，讓 rag_answer 返回錯誤訊息
+
+# ====== FAISS RAG (純檢索) 問答邏輯 ======
+def rag_answer(question: str) -> str:
+    # 確保 vectorstore 在處理請求前被載入
+    ensure_vectorstore()
+
+    if vectorstore:
+        try:
+            docs_and_scores: List[Tuple] = vectorstore.similarity_search_with_score(question, k=1)
+            
+            if docs_and_scores:
+                doc, score = docs_and_scores[0]
+                distance = score
+                # 這裡的 SIMILARITY_THRESHOLD 是針對轉換後的相似度
+                # L2 距離越小越好，我們將其反向映射到一個 0-1 相似度
+                # 簡單轉換：相似度 = 1 / (1 + 距離)
+                # 距離為 0 時相似度為 1；距離越大，相似度越趨近 0
+                similarity = 1 / (1 + distance)
+                print(f"RAG 搜尋結果：L2 距離={distance:.4f}, 轉換後相似度={similarity:.4f}")
+
+                if similarity >= SIMILARITY_THRESHOLD:
+                    print("RAG 相似度達標，使用內部資料回答。")
+                    return doc.page_content
+                else:
+                    print("RAG 相似度未達標，返回預設訊息。")
+                    return "抱歉，我只知道關於內部資料的資訊，無法回答您的問題。請嘗試提出更相關的問題。"
             else:
-                print(f"不支援的格式：{file}")
-                continue
-            new_documents.extend(docs)
-    if new_documents:
-        texts = splitter.split_documents(new_documents)
-        db.add_documents(texts)
-        db.save_local(VECTOR_STORE_PATH)
-        save_docs_state(docs_state)
-    return db
+                print("未找到任何相關文檔。")
+                return "抱歉，我只知道關於內部資料的資訊，無法回答您的問題。請嘗試提出更相關的問題。"
 
-def ensure_qa():
-    global vectorstore, qa
-    current_docs_state = get_current_docs_state()
-    last_docs_state = load_last_docs_state()
-    if vectorstore is None:
-        if os.path.exists(VECTOR_STORE_PATH) and os.listdir(VECTOR_STORE_PATH):
-            vectorstore = FAISS.load_local(VECTOR_STORE_PATH, embedding_model, allow_dangerous_deserialization=True)
-            new_files = get_new_or_updated_files(current_docs_state, last_docs_state)
-            if new_files:
-                print(f"偵測到新文件或文件變動：{new_files}，自動增量加入向量庫！")
-                vectorstore = add_new_files_to_vector_store(vectorstore, new_files, current_docs_state)
-            elif len(current_docs_state) != len(last_docs_state):
-                print(f"文件數變動，重新建構向量庫")
-                vectorstore = build_vector_store(current_docs_state)
-        else:
-            vectorstore = build_vector_store(current_docs_state)
+        except Exception as e:
+            print(f"RAG 搜尋失敗: {e}")
+            return "抱歉，在搜尋內部資料時發生錯誤，請稍後再試。"
     else:
-        new_files = get_new_or_updated_files(current_docs_state, last_docs_state)
-        if new_files:
-            print(f"偵測到新文件或文件變動：{new_files}，自動增量加入向量庫！")
-            vectorstore = add_new_files_to_vector_store(vectorstore, new_files, current_docs_state)
-        elif len(current_docs_state) != len(last_docs_state):
-            print(f"文件數變動，重新建構向量庫")
-            vectorstore = build_vector_store(current_docs_state)
+        print("FAISS 向量索引未成功載入。無法進行檢索。")
+        return "抱歉，核心知識庫尚未準備好，請聯繫管理員。"
 
-    if qa is None:
-        qa = RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type="stuff",
-            retriever=vectorstore.as_retriever()
-        )
-
-def rag_answer(question):
-    ensure_qa()
-    return qa.run(question)
-
-def handle_upload(files, progress=gr.Progress()):
-    new_files = []
-    total = len(files)
-    for idx, file in enumerate(files):
-        filename = os.path.basename(file.name)
-        dest = os.path.join(DOCUMENTS_PATH, filename)
-        shutil.copyfile(file.name, dest)
-        new_files.append(filename)
-        progress((idx + 1) / total, desc=f"複製檔案：{filename}")
-    progress(0.8, desc="正在匯入向量庫 ...")
-    current_docs_state = get_current_docs_state()
-    last_docs_state = load_last_docs_state()
-    db = None
-    if os.path.exists(VECTOR_STORE_PATH) and os.listdir(VECTOR_STORE_PATH):
-        db = FAISS.load_local(VECTOR_STORE_PATH, embedding_model, allow_dangerous_deserialization=True)
-    else:
-        db = build_vector_store(current_docs_state)
-        return (f"向量庫首次建立完成，共匯入 {len(new_files)} 檔案。", get_uploaded_files_list())
-    add_new_files_to_vector_store(db, new_files, current_docs_state)
-    progress(1.0, desc="完成！")
-    return (f"成功匯入 {len(new_files)} 檔案並加入向量庫：{', '.join(new_files)}", get_uploaded_files_list())
-
-# ===== Gradio UI 主程式（新版版面配置） =====
-with gr.Blocks() as demo:
-    gr.Markdown("# Cohere 向量檢索問答機器人")
-    with gr.Row():
-        with gr.Column(scale=2):
-            question_box = gr.Textbox(label="輸入問題", placeholder="請輸入問題")
-            submit_btn = gr.Button("送出")
-            answer_box = gr.Textbox(label="AI 回答")
-        with gr.Column(scale=1):
-            upload_box = gr.File(
-                label="上傳新文件（支援 doc/docx/xls/xlsx/pdf/txt/csv，多選）",
-                file_count="multiple",
-                file_types=[".doc", ".docx", ".xls", ".xlsx", ".pdf", ".txt", ".csv"]
-            )
-            upload_btn = gr.Button("匯入並轉換成向量資料庫")
-            status_box = gr.Textbox(label="操作狀態/訊息")
-            file_list_box = gr.Textbox(label="已上傳檔案清單", value=get_uploaded_files_list(), interactive=False, lines=8)
-    upload_btn.click(
-        fn=handle_upload,
-        inputs=[upload_box],
-        outputs=[status_box, file_list_box]
-    )
-    submit_btn.click(fn=rag_answer, inputs=question_box, outputs=answer_box)
-
-# ===== FastAPI 設定 =====
+# ====== FastAPI + LINE + Gradio ======
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -204,16 +136,57 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+async def root():
+    return {"status": "running"}
+
+# LINE Webhook 回調
+@app.post("/callback")
+async def callback(request: Request):
+    signature = request.headers.get("X-Line-Signature", "")
+    body = (await request.body()).decode()
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    return "OK"
+
+# LINE 訊息處理
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event: MessageEvent):
+    user_text = event.message.text
+    reply = rag_answer(user_text)
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=reply)
+    )
+
+# Gradio UI
+with gr.Blocks() as demo:
+    gr.Markdown("# 內部知識庫問答機器人 (純檢索)")
+    gr.Markdown("此機器人僅基於內部文件庫進行相似度檢索，不使用外部 LLM 生成回答。")
+    with gr.Row():
+        with gr.Column():
+            qbox = gr.Textbox(label="請輸入問題")
+            abox = gr.Textbox(label="回答", interactive=False) # 回答框不可編輯
+            btn = gr.Button("送出")
+            btn.click(fn=rag_answer, inputs=qbox, outputs=abox)
+
 from gradio.routes import mount_gradio_app
 app = mount_gradio_app(app, demo, path="/gradio")
 
-@app.get("/", include_in_schema=False)
-async def root():
-    return RedirectResponse(url="/gradio")
+if __name__ == "__main__":
+    import uvicorn
+    # 將 port 設定為 Render 預設的 10000
+    port = int(os.getenv("PORT", "10000"))
+    
+    # 在啟動 Uvicorn 服務之前，確保向量索引已經載入
+    ensure_vectorstore() 
 
-@app.post("/webhook")
-async def webhook(request: Request):
-    payload = await request.json()
-    user_message = payload.get("message", "")
-    reply = rag_answer(user_message)
-    return {"reply": reply}
+    # 只有當 vectorstore 成功載入時才啟動服務
+    if vectorstore is not None:
+        uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    else:
+        print("由於 FAISS 索引載入失敗，應用程式無法正常啟動。")
+        exit(1) # 強制退出，避免在沒有知識庫的情況下運行
